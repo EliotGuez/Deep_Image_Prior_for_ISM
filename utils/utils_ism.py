@@ -1,348 +1,241 @@
 from __future__ import annotations
 
+import math
+from pathlib import Path
+from typing import Any, Dict
+
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn.functional as F
-from torch import nn
-import matplotlib.pyplot as plt
-from skimage.io import imsave
-
-import deepinv as dinv
-from deepinv.physics import Denoising, PoissonNoise
 
 import ISM.simulation.PSF_sim as ism
-import ISM.simulation.generate_ism_phantom as gen
+import ISM.simulation.detector as ism_detector
+from torchvision.transforms.functional import rotate as tv_rotate
 
 
-def _make_grid(Kh: int = 99, pxpitch=75e3, pxsizex=30):
-    grid          = ism.GridParameters()
-    grid.N        = 5
-    grid.Nx       = Kh
-    grid.pxsizex  = 30       # nm/px  taille d'un pixel dans l'espace objet plus c'est petit  plus la psf est résolue dans l'image 
-    grid.pxdim    = 50e3     # nm
-    grid.pxpitch  = pxpitch    # nm  controlent la taille effective  du pinhole pour chaque détecteur donc pinhole grand fait plus de lumière, élargit la psf de détection
-    grid.M        = 500    # Change la taille apparente du pinhole dans l'espace objet 
-    grid.Nz       = 1
-    grid.pxsizez  = 700      # nm
-    return grid
+EPS = 1e-12
+FIXED_MIRRORING = -1
+FIXED_ROTATION_DEG = -76.30
+
+def center_crop(x, size):
+    h, w = x.shape[-2:]
+    if size >= h and size >= w:
+        return x
+    y0 = max((h - size) // 2, 0)
+    x0 = max((w - size) // 2, 0)
+    return x[..., y0:y0 + min(size, h), x0:x0 + min(size, w)]
 
 
-def _make_optical_params(wl, zer_idx=None, zer_ampli=None):
-    par            = ism.simSettings()
-    par.n          = 1.5   # NA = n · sin(α), NA max = n
-    par.na         = 1.2   # plus na est grand plus la psf est petite et piqué : r ~\lambda / NA
-    par.wl         = wl    # \lambda grand donne psf plus large  donc psf d'émission est plus large que psf d'excitation
-    par.mask_sampl = 31
-    if zer_idx is not None:
-        par.abe_index = zer_idx
-    if zer_ampli is not None:
-        par.abe_ampli = zer_ampli
-    return par
+def load_real_data(path, z_idx, crop_size, device):
 
-def generate_25_psf_zernike(Kh=99, zer_coeff_ex=None, zer_coeff_em=None, coeff_scale=0.3, seed=None, ZERNIKE_MAX=15,ZERNIKE_FIXED=1):
+    data = torch.load(path, map_location="cpu", weights_only=False)
+    meas = data["measurment"].float()
+    if meas.dim() == 3:
+        meas = meas.unsqueeze(1)
+    original_shape = tuple(meas.shape)
+    meas = center_crop(meas, crop_size)
 
-    ZERNIKE_FREE = ZERNIKE_MAX - ZERNIKE_FIXED
-    rng = np.random.default_rng(seed)
+    psf = data["PSF"].float()
+    if psf.dim() == 3:
+        psf = psf.unsqueeze(1)
+    if not (0 <= z_idx < psf.shape[1]):
+        raise ValueError(f"psf_z_idx={z_idx}, but PSF has {psf.shape[1]} plane(s).")
+    ref_psf = psf[:, z_idx:z_idx + 1]
+    fingerprint = ref_psf.flatten(1).sum(1).view(-1, 1, 1, 1)
+    ref_psf_norm = ref_psf / (fingerprint + EPS)
 
-    if zer_coeff_ex is None:
-        zer_coeff_ex = torch.tensor(rng.uniform(-coeff_scale, coeff_scale, size=ZERNIKE_FREE), dtype=torch.float32)
-    if zer_coeff_em is None:
-        zer_coeff_em = torch.tensor(rng.uniform(-coeff_scale, coeff_scale, size=ZERNIKE_FREE), dtype=torch.float32)
+    meta = data.get("metadati", None)
+    if meta is None or not hasattr(meta, "dx"):
+        raise ValueError("metadati.dx is required to build the real detector grid.")
+    pxsizex_nm = float(meta.dx) * 1e3
 
-    gt_zer_ex = torch.cat([torch.zeros(ZERNIKE_FIXED), zer_coeff_ex])
-    gt_zer_em = torch.cat([torch.zeros(ZERNIKE_FIXED), zer_coeff_em])
-    zernike_idx = torch.arange(ZERNIKE_MAX)
-
-    grid  = _make_grid(Kh)
-    exPar = _make_optical_params(450, zernike_idx, gt_zer_ex)
-    emPar = _make_optical_params(660, zernike_idx, gt_zer_em)
-    emPar.n  = exPar.n
-    emPar.na = exPar.na
-    emPar.mask_sampl = exPar.mask_sampl
-
-    PSF, detPSF, exPSF = ism.SPAD_PSF_2D(grid, exPar, emPar)
-    return PSF, gt_zer_ex, gt_zer_em, exPSF, detPSF, grid
-
-
-def reconstruct_single_psf(zer_coeff, wl, Kh=99, device="cpu", dtype=torch.float32):
-
-    grid = _make_grid(Kh)
-    zernike_idx = torch.arange(len(zer_coeff))
-    par = _make_optical_params(wl, zernike_idx, zer_coeff)
-
-    psf, _ = ism.singlePSF(par, grid.pxsizex, grid.Nx, [0, 0], grid.Nz, device)
-    psf = psf.squeeze()
-    psf = psf / (psf.sum() + 1e-12)
-    return psf.to(device=device, dtype=dtype)
-
-
-def reconstruct_psf_from_zernike(zer_ex,zer_em, Kh=99, device="cpu", dtype=torch.float32):
-
-    grid = _make_grid(Kh)
-    zernike_idx = torch.arange(len(zer_ex))
-    exP = _make_optical_params(450, zernike_idx, zer_ex)
-    emP = _make_optical_params(660, zernike_idx, zer_em)
-    emP.n  = exP.n
-    emP.na  = exP.na
-    emP.mask_sampl = exP.mask_sampl
-
-    PSF_rec, _, _ = ism.SPAD_PSF_2D(grid, exP, emP)
-    return PSF_rec.to(device=device, dtype=dtype)
-
-
-def generate_phantom_data(phantom_type, Nx, Ny, Nz, device, pxsize=40, flux=40):
-    image = gen.generate_phantom(phantom_type, Nx, Ny, Nz, pxsizex=pxsize)
-    ground_truth = flux * image.to(device)
-    return ground_truth
-
-
-def simulate_measurement(PSF, Nx, ground_truth, device, gain=1.0, back_lvl=0.01):
-    physics_blur  = dinv.physics.BlurFFT(img_size=(1, 1, Nx, Nx), filter=PSF, device=device)
-    back = torch.tensor(back_lvl, device=device)
-    blurred_image = physics_blur(ground_truth.repeat(25, 1, 1, 1)) + back.repeat(25, 1, 1, 1)
-
-    denoiser = Denoising()
-    denoiser.noise_model  = PoissonNoise(gain=gain)
-    noise_image = denoiser(blurred_image)
-
-    return noise_image, blurred_image, physics_blur
-
-
-
-class PoissonNLL(nn.Module):
-    """
-    Poisson negative log-likelihood:  sum( lam/gain - (y/gain)*log(lam) )
-    """
-    def __init__(self, eps=1e-8, gain=1.0):
-        super().__init__()
-        self.eps         = eps
-        self.gain        = gain
-
-    def forward(self, x, y, physics):
-        lam = physics(x).clamp_min(self.eps)
-        loss_map = lam / self.gain - (y / self.gain) * torch.log(lam)
-        return loss_map.sum()
-
-
-
-def psnr_torch(x: torch.Tensor, y: torch.Tensor,
-               data_range=None, eps: float = 1e-12) -> torch.Tensor:
-    mse        = torch.mean((x - y) ** 2)
-    if data_range is None:
-        data_range = torch.max(y) - torch.min(y)
-    data_range = torch.clamp(torch.as_tensor(data_range, dtype=torch.float32), min=eps)
-    return 10 * torch.log10((data_range ** 2) / torch.clamp(mse, min=eps))
-
-
-def compute_grouped_kernel_mse(pred_k: torch.Tensor, gt_k: torch.Tensor) -> dict:
-    groups = {
-        "outer":  [0, 1, 2, 3, 4, 5, 9, 10, 14, 15, 19, 20, 21, 22, 23, 24],
-        "inner":  [6, 7, 8, 11, 13, 16, 17, 18],
-        "center": [12],
+    return {
+        "meas": meas.to(device),
+        "ref_psf": ref_psf_norm.to(device),
+        "metadata": meta,
+        "pxsizex_nm": pxsizex_nm,
+        "original_shape": original_shape,
+        "optics": {k: data.get(k, None) for k in ("exwl", "emwl", "na")},
     }
-    return {f"psf_mse_{name}": torch.mean((pred_k[idx] - gt_k[idx]) ** 2).item() for name, idx in groups.items()}
 
 
-def save_tensor_image(x: torch.Tensor, path) -> None:
-    """Save any tensor that squeezes to (H, W) as a uint8 PNG."""
-    x = x.detach().cpu().squeeze().numpy()
-    x = np.clip(x, 0, None)
-    x = x / (x.max() + 1e-8)
-    imsave(str(path), (255 * x).astype(np.uint8))
+def barycentres_xy(stack):
+    if stack.dim() == 4:
+        stack = stack[:, 0]
+    stack = stack.detach().float()
+    _, h, w = stack.shape
+    yy, xx = torch.meshgrid(
+        torch.arange(h, device=stack.device, dtype=stack.dtype),
+        torch.arange(w, device=stack.device, dtype=stack.dtype),
+        indexing="ij",
+    )
+    mass = stack.sum(dim=(-2, -1)).clamp_min(EPS)
+    bx = (stack * xx).sum(dim=(-2, -1)) / mass - (w - 1) / 2
+    by = (stack * yy).sum(dim=(-2, -1)) / mass - (h - 1) / 2
+    return torch.stack((bx, by), dim=1).cpu().numpy()
 
 
-def save_kernels_grid(kernels: torch.Tensor, path, nrow: int = 5) -> None:
-    """Save (25, 1, Kh, Kw) kernel stack as a 5×5 grid image."""
-    k    = kernels.detach().cpu().squeeze(1).numpy()   # (25, Kh, Kw)
-    D    = k.shape[0]
-    ncol = nrow
-    nrow_plot = int(np.ceil(D / ncol))
+def make_detector_masks(grid, mirroring=1, rotation_deg=0.0, device="cpu"):
+    n = int(grid.N)
+    coords = ism_detector.det_coords(grid.N, grid.geometry)
+    coords = coords * grid.pxpitch
+    coords = torch.round(coords / grid.M / grid.pxsizex).to(torch.int)
 
-    fig, axes = plt.subplots(nrow_plot, ncol, figsize=(10, 10))
-    axes      = np.array(axes).reshape(nrow_plot, ncol)
-    vmin, vmax = k.min(), k.max()
+    detector = ism_detector.pinhole_array(coords, int(grid.Nx), grid.M, grid.pxsizex, grid.pxdim, grid.pinhole_shape, torch.device(device))
 
-    for i in range(nrow_plot * ncol):
-        ax = axes.flat[i]
+    if int(mirroring) == -1:
+        if isinstance(n, tuple):
+            nx, ny = n
+        else:
+            nx = ny = n
+        nch = detector.shape[-1]
+        detector = detector.reshape(int(grid.Nx), int(grid.Nx), nx, ny)
+        detector = torch.flip(detector, dims=(-1,))
+        detector = detector.reshape(int(grid.Nx), int(grid.Nx), nch)
+
+    if abs(float(rotation_deg)) > 1e-12:
+        detector = torch.movedim(detector, -1, 0)
+        detector = tv_rotate(detector, float(rotation_deg))
+        detector = torch.movedim(detector, 0, -1)
+
+    detector = detector.clone()
+    detector[detector < 1e-2] = 0
+    return detector
+
+
+def similarity_score(p, q):
+    """Fit q ~= scale*p + translation; return RMSE, scale, R^2."""
+    p0 = p - p.mean(0, keepdims=True)
+    q0 = q - q.mean(0, keepdims=True)
+    denom = float(np.sum(p0 * p0))
+    if denom <= 0:
+        return float("inf"), 0.0, -float("inf")
+    scale = float(np.sum(p0 * q0) / denom)
+    if scale <= 0:
+        return float("inf"), scale, -float("inf")
+    pred = scale * p0 + q.mean(0, keepdims=True)
+    resid = q - pred
+    rmse = float(np.sqrt(np.mean(np.sum(resid * resid, axis=1))))
+    ss_res = float(np.sum(resid * resid))
+    ss_tot = float(np.sum(q0 * q0))
+    r2 = 1.0 - ss_res / max(ss_tot, EPS)
+    return rmse, scale, r2
+
+
+
+def pinhole_centres(grid, mirroring, rotation_deg):
+    pinholes = make_detector_masks(grid, mirroring, rotation_deg, device="cpu")
+    return barycentres_xy(pinholes.permute(2, 0, 1))
+
+
+def evaluate_fixed_orientation(grid, ref_psf):
+    target = barycentres_xy(ref_psf.cpu())
+    centres = pinhole_centres(grid, FIXED_MIRRORING, FIXED_ROTATION_DEG)
+    rmse, scale, r2 = similarity_score(centres, target)
+    return {
+        "rotation_deg": float(FIXED_ROTATION_DEG),
+        "rotation_rad": float(math.radians(FIXED_ROTATION_DEG)),
+        "mirroring": int(FIXED_MIRRORING),
+        "scale": float(scale),
+        "rmse_px": float(rmse),
+        "r2": float(r2),
+    }
+
+
+def build_real_grid(kh, pxsizex_nm, ref_psf):
+    grid = ism.GridParameters()
+    grid.N = 5
+    grid.Nx = kh
+    grid.Nz = 1
+    grid.pxsizex = float(pxsizex_nm)
+    grid.mirroring = int(FIXED_MIRRORING)
+    grid.rotation = float(math.radians(FIXED_ROTATION_DEG))
+    calibration = evaluate_fixed_orientation(grid, ref_psf)
+    return grid, calibration
+
+
+def scalar(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu().item()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def print_inspection(bundle, grid, calibration):
+    meas, ref = bundle["meas"], bundle["ref_psf"]
+    print("\n" + "=" * 72)
+    print("REAL ISM INSPECTION")
+    print("=" * 72)
+    print(f"torch version        : {torch.__version__}")
+    print(f"torch path           : {torch.__file__}")
+    print("detector transform   : local fixed geometry (ISM transform_detector not used)")
+    print(f"original measurement : {bundle['original_shape']}")
+    print(f"cropped measurement  : {tuple(meas.shape)}")
+    print(f"measurement range    : [{meas.min().item():.4g}, {meas.max().item():.4g}]")
+    print(f"reference PSF        : {tuple(ref.shape)}")
+    print(f"optical metadata     : {bundle['optics']}")
+    print(f"pxsizex              : {bundle['pxsizex_nm']:.6f} nm (metadati.dx x 1000)")
+    print("\nDetector grid:")
+    for key in ("N", "Nx", "Nz", "pxpitch", "pxdim", "M", "geometry", "pinhole_shape"):
+        print(f"  {key:14s}: {scalar(getattr(grid, key))}")
+    pitch_px = float(scalar(grid.pxpitch)) / float(scalar(grid.M)) / float(scalar(grid.pxsizex))
+    print(f"  pitch on PSF : {pitch_px:.6f} px")
+    print("\nFixed detector orientation (sanity-checked against stored PSFs):")
+    print(f"  mirroring    : {calibration['mirroring']}")
+    print(f"  rotation     : {calibration['rotation_deg']:+.2f} deg ({calibration['rotation_rad']:+.4f} rad)")
+    print(f"  scale        : {calibration['scale']:.4f}")
+    print(f"  RMSE         : {calibration['rmse_px']:.4f} px")
+    print(f"  R^2          : {calibration['r2']:.4f}")
+    print("=" * 72 + "\n")
+
+
+# -----------------------------------------------------------------------------
+# Saving helpers
+# -----------------------------------------------------------------------------
+def save_image(x, path):
+    arr = x.detach().cpu().squeeze().float().numpy()
+    arr = np.clip(arr, 0, None)
+    arr = arr / (arr.max() + 1e-12)
+    plt.figure(figsize=(6, 6))
+    plt.imshow(arr, cmap="gray")
+    plt.axis("off")
+    plt.tight_layout(pad=0)
+    plt.savefig(path, dpi=150, bbox_inches="tight", pad_inches=0)
+    plt.close()
+
+
+def save_stack(stack, path, title):
+    arr = stack.detach().cpu().squeeze(1).numpy()
+    fig, axes = plt.subplots(5, 5, figsize=(10, 10))
+    vmax = float(arr.max())
+    for i, ax in enumerate(axes.flat):
+        ax.imshow(arr[i], cmap="hot", vmin=0, vmax=vmax)
+        ax.set_title(str(i), fontsize=8)
         ax.axis("off")
-        if i < D:
-            ax.imshow(k[i], cmap="hot", vmin=vmin, vmax=vmax)
-            ax.set_title(f"k{i}", fontsize=8)
-
+    if title:
+        fig.suptitle(title)
     plt.tight_layout()
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
-def save_stack_grid(x: torch.Tensor, path, nrow: int = 5, cmap: str = "hot") -> None:
-    """Save a (25, 1, H, W) observation stack as a 5×5 grid image."""
-    arr  = x.detach().cpu().squeeze(1).numpy()
-    D    = arr.shape[0]
-    ncol = nrow
-    nrow_plot = int(np.ceil(D / ncol))
-
-    fig, axes = plt.subplots(nrow_plot, ncol, figsize=(10, 10))
-    axes      = np.array(axes).reshape(nrow_plot, ncol)
-    vmin, vmax = arr.min(), arr.max()
-
-    for i in range(nrow_plot * ncol):
-        ax = axes.flat[i]
-        ax.axis("off")
-        if i < D:
-            ax.imshow(arr[i], cmap=cmap, vmin=vmin, vmax=vmax)
-            ax.set_title(f"{i}", fontsize=8)
-
-    plt.tight_layout()
-    plt.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-
-def save_two_psfs(h_exc: torch.Tensor, h_em: torch.Tensor, path) -> None:
-    """Save excitation and emission PSFs side by side."""
-    def _prep(h):
-        h = h.detach().cpu()
-        while h.dim() > 2:
-            h = h.squeeze(0)
-        return h.numpy()
-
+def save_two_psfs(h_exc, h_em, path):
     fig, axes = plt.subplots(1, 2, figsize=(8, 4))
-    axes[0].imshow(_prep(h_exc), cmap="hot")
+    axes[0].imshow(h_exc.detach().cpu().squeeze(), cmap="hot")
     axes[0].set_title("Excitation PSF")
-    axes[0].axis("off")
-    axes[1].imshow(_prep(h_em), cmap="hot")
+    axes[1].imshow(h_em.detach().cpu().squeeze(), cmap="hot")
     axes[1].set_title("Emission PSF")
-    axes[1].axis("off")
+    for ax in axes:
+        ax.axis("off")
     plt.tight_layout()
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
-# Saving — curves & Zernike plots
-# ---------------------------------------------------------------------------
-
-def save_curves(metric_dict: dict, path) -> None:
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for key, val in metric_dict.items():
-        if len(val) > 0:
-            ax.plot(val, label=key)
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("Metric")
-    ax.legend()
-    ax.grid(True)
-    plt.tight_layout()
-    plt.savefig(path, dpi=150)
-    plt.close(fig)
-
-
-def save_zernike_comparison(
-    gt_zer_ex, gt_zer_em,
-    fit_zer_ex, fit_zer_em,
-    path,
-) -> None:
-    """Side-by-side bar chart: GT vs fitted Zernike coefficients."""
-    gt_zer_ex  = torch.as_tensor(gt_zer_ex).detach().cpu().numpy()
-    gt_zer_em  = torch.as_tensor(gt_zer_em).detach().cpu().numpy()
-    fit_zer_ex = torch.as_tensor(fit_zer_ex).detach().cpu().numpy()
-    fit_zer_em = torch.as_tensor(fit_zer_em).detach().cpu().numpy()
-
-    x     = np.arange(len(gt_zer_ex))
-    width = 0.4
-    labels = [f"Z{i}" for i in x]
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    for ax, gt, fit, title in zip(
-        axes,
-        [gt_zer_ex, gt_zer_em],
-        [fit_zer_ex, fit_zer_em],
-        ["Excitation", "Emission"],
-    ):
-        ax.bar(x - width / 2, gt,  width, label="Ground Truth", color="steelblue",  alpha=0.8)
-        ax.bar(x + width / 2, fit, width, label="Fitted",        color="darkorange", alpha=0.8)
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels, rotation=45, ha="right")
-        ax.set_title(f"Zernike Coefficients — {title}")
-        ax.set_ylabel("Amplitude (rad)")
-        ax.axhline(0, color="black", linewidth=0.8)
-        ax.legend()
-        ax.grid(axis="y", alpha=0.4)
-
-    plt.tight_layout()
-    plt.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-def save_zernike_gt(
-    gt_zer_ex,
-    gt_zer_em,
-    path,
-):
-    gt_zer_ex = torch.as_tensor(gt_zer_ex).detach().cpu().numpy()
-    gt_zer_em = torch.as_tensor(gt_zer_em).detach().cpu().numpy()
-
-    x = np.arange(len(gt_zer_ex))
-    labels = [f"Z{i}" for i in x]
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-    for ax, gt, title in zip(
-        axes,
-        [gt_zer_ex, gt_zer_em],
-        ["Excitation GT", "Emission GT"],
-    ):
-        ax.bar(x, gt, color="steelblue", alpha=0.8)
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels, rotation=45, ha="right")
-        ax.set_title(f"Ground Truth Zernike Coefficients — {title}")
-        ax.set_ylabel("Amplitude (rad)")
-        ax.axhline(0, color="black", linewidth=0.8)
-        ax.grid(axis="y", alpha=0.4)
-
-    plt.tight_layout()
-    plt.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-def save_zernike_history(history: torch.Tensor, path) -> None:
-    """Plot multi-start Zernike optimisation loss curves."""
-    history = torch.as_tensor(history).detach().cpu().numpy()
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for i in range(history.shape[0]):
-        ax.semilogy(history[i], label=f"start {i}")
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("Fitting loss")
-    ax.legend()
-    ax.grid(True)
-    plt.tight_layout()
-    plt.savefig(path, dpi=150)
-    plt.close(fig)
-
-
-# ---------------------------------------------------------------------------
-# Misc
-# ---------------------------------------------------------------------------
-
-def gaussian_kernel2d(size: tuple, sigma: float) -> torch.Tensor:
-    """Return a normalised 2-D Gaussian kernel of shape (H, W)."""
-    H, W = size
-    assert H % 2 == 1 and W % 2 == 1, "Kernel size must be odd."
-    ax = torch.arange(-(W // 2), W // 2 + 1).view(1, W).float()
-    ay = torch.arange(-(H // 2), H // 2 + 1).view(H, 1).float()
-    kernel = torch.exp(-(ax ** 2 + ay ** 2) / (2.0 * sigma ** 2))
-    return kernel / kernel.sum()
-
-def gaussian_beads(grid_size, num_beads, sigma, flux=1.0, device="cpu", dtype=torch.float32, seed=None):
-
-    rng = np.random.default_rng(seed)
-    coords = rng.integers(0, grid_size, size=(num_beads, 2))  # (N, 2) in (row, col)
-
-    ax = torch.arange(grid_size, dtype=torch.float32)
-    yy, xx = torch.meshgrid(ax, ax, indexing="ij")  # (H, W) each
-
-    image = torch.zeros(grid_size, grid_size, dtype=torch.float32)
-    for row, col in coords:
-        image += torch.exp(-((xx - col) ** 2 + (yy - row) ** 2) / (2.0 * sigma ** 2))
-
-    image = image / (image.max() + 1e-8)          # normalise to [0, 1]
-    image = (image * flux).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
-
-    return image.to(device=device, dtype=dtype)
-
+def gaussian_kernel(kh, kw, sigma, device):
+    yy = torch.arange(kh, device=device) - (kh - 1) / 2
+    xx = torch.arange(kw, device=device) - (kw - 1) / 2
+    Y, X = torch.meshgrid(yy, xx, indexing="ij")
+    g = torch.exp(-(X * X + Y * Y) / (2 * sigma * sigma))
+    return g / g.sum()

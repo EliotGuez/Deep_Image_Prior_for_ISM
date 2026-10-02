@@ -23,3 +23,6 @@ logs/
 *.ckpt
 
 .DS_Store
+old/
+/results
+/runs
