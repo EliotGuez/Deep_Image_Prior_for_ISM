@@ -26,3 +26,7 @@ logs/
 old/
 /results
 /runs
+*.err
+*.out
+runs06/
+runs062/
